@@ -1,0 +1,283 @@
+name: InnovateMart Terraform CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'feature/**'
+      - 'hotfix/**'
+    paths:
+      - '**.tf'
+      - '.github/workflows/**'
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - '**.tf'
+
+env:
+  TF_VERSION: "1.5.0"
+  AWS_REGION: "eu-west-1"
+  
+jobs:
+  terraform-validate:
+    name: 'Terraform Validate'
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+
+    - name: Terraform Format Check
+      run: terraform fmt -check -recursive
+      continue-on-error: true
+
+    - name: Terraform Init
+      run: terraform init -backend=false
+
+    - name: Terraform Validate
+      run: terraform validate
+
+  terraform-plan:
+    name: 'Terraform Plan'
+    runs-on: ubuntu-latest
+    needs: terraform-validate
+    if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
+    
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    
+    outputs:
+      plan-exitcode: ${{ steps.plan.outputs.exitcode }}
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        role-session-name: terraform-plan-session
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+
+    - name: Terraform Init
+      run: |
+        terraform init \
+          -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+          -backend-config="key=innovatemart/terraform.tfstate" \
+          -backend-config="region=${{ env.AWS_REGION }}"
+
+    - name: Terraform Plan
+      id: plan
+      run: |
+        terraform plan \
+          -detailed-exitcode \
+          -no-color \
+          -out=tfplan \
+          -var="aws_region=${{ env.AWS_REGION }}"
+      continue-on-error: true
+
+    - name: Create Plan Summary
+      if: steps.plan.outcome == 'success'
+      run: |
+        echo "## Terraform Plan Summary" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** ${{ steps.plan.outcome }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Exit Code:** ${{ steps.plan.outputs.exitcode }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ steps.plan.outputs.exitcode }}" = "2" ]; then
+          echo "### Changes Detected ⚠️" >> $GITHUB_STEP_SUMMARY
+          echo "Terraform has detected changes to apply." >> $GITHUB_STEP_SUMMARY
+        elif [ "${{ steps.plan.outputs.exitcode }}" = "0" ]; then
+          echo "### No Changes Detected ✅" >> $GITHUB_STEP_SUMMARY  
+          echo "Infrastructure is up to date." >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Comment PR with Plan
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const planExitCode = '${{ steps.plan.outputs.exitcode }}';
+          let planStatus = '';
+          let planIcon = '';
+          
+          if (planExitCode === '0') {
+            planStatus = 'No changes detected';
+            planIcon = '✅';
+          } else if (planExitCode === '2') {
+            planStatus = 'Changes detected';
+            planIcon = '⚠️';
+          } else {
+            planStatus = 'Plan failed';
+            planIcon = '❌';
+          }
+
+          const output = `## Terraform Plan Results ${planIcon}
+
+          **Branch:** \`${{ github.head_ref }}\`
+          **Status:** ${planStatus}
+          **Exit Code:** ${planExitCode}
+
+          ### Plan Summary
+          - **Terraform Version:** ${{ env.TF_VERSION }}
+          - **AWS Region:** ${{ env.AWS_REGION }}
+          - **Environment:** ${planExitCode === '0' ? 'No changes required' : 'Changes pending approval'}
+
+          <details>
+          <summary>Show Plan Details</summary>
+
+          \`\`\`
+          Terraform plan completed with exit code: ${planExitCode}
+          
+          Exit codes:
+          - 0: No changes
+          - 2: Changes detected  
+          - 1: Error occurred
+          \`\`\`
+
+          </details>
+
+          > **Note:** This plan will be applied automatically when merged to main branch.
+          `;
+
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+          });
+
+  terraform-apply:
+    name: 'Terraform Apply'
+    runs-on: ubuntu-latest
+    needs: terraform-validate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        role-session-name: terraform-apply-session
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+
+    - name: Terraform Init
+      run: |
+        terraform init \
+          -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+          -backend-config="key=innovatemart/terraform.tfstate" \
+          -backend-config="region=${{ env.AWS_REGION }}"
+
+    - name: Terraform Plan
+      run: |
+        terraform plan \
+          -detailed-exitcode \
+          -out=tfplan \
+          -var="aws_region=${{ env.AWS_REGION }}"
+
+    - name: Terraform Apply
+      run: terraform apply -auto-approve tfplan
+
+    - name: Create Apply Summary
+      if: success()
+      run: |
+        echo "## Terraform Apply Completed ✅" >> $GITHUB_STEP_SUMMARY
+        echo "**Branch:** main" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** Successfully applied" >> $GITHUB_STEP_SUMMARY
+        echo "**Region:** ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Infrastructure Updated" >> $GITHUB_STEP_SUMMARY
+        echo "All Terraform changes have been successfully applied to the production environment." >> $GITHUB_STEP_SUMMARY
+
+  security-scan:
+    name: 'Security Scan'
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Run Checkov Security Scan
+      uses: bridgecrewio/checkov-action@master
+      with:
+        directory: .
+        framework: terraform
+        output_format: sarif
+        output_file_path: checkov-results.sarif
+        soft_fail: true
+
+    - name: Upload Checkov Results
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: checkov-results.sarif
+
+  drift-detection:
+    name: 'Drift Detection'
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        role-session-name: drift-detection-session
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+
+    - name: Terraform Init
+      run: |
+        terraform init \
+          -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+          -backend-config="key=innovatemart/terraform.tfstate" \
+          -backend-config="region=${{ env.AWS_REGION }}"
+
+    - name: Detect Configuration Drift
+      run: |
+        terraform plan -detailed-exitcode -no-color
+        if [ $? -eq 2 ]; then
+          echo "⚠️ Configuration drift detected!"
+          echo "drift_detected=true" >> $GITHUB_OUTPUT
+        fi
