@@ -337,4 +337,4 @@ output "kubectl_config" {
 output "node_group_status" {
   description = "Status of the EKS node group"
   value       = aws_eks_node_group.main.status
-}
+}# CI/CD Pipeline Test
